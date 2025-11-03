@@ -1,57 +1,54 @@
-"""
-temporal_instruct_smoothing.py
-
-用途：
-- 输入：一组 GT 帧（frame_000.png ... frame_009.png）和对应的 Instruct prompt
-- 先用 InstructPix2Pix 对每帧做风格迁移（或假设你已有 pix2pix_outputs）
-- 然后基于 diffusers 对迁移结果做潜空间光流对齐 + 带初始化的 image2image 采样
-- 输出：smoothed stylized frames
-
-说明：
-- 代码用光流 (Farneback) 对齐像素坐标，然后将像素坐标映射到 VAE latent 尺度做 remap。
-- 若你的 pipeline 暴露 VAE encoder/decoder（diffusers pipeline 通常有），我们用它来计算 latents。
-- 若使用 InstructPix2PixPipeline 名称不一致，可把 pipeline 换为 StableDiffusionImg2ImgPipeline 并调整 prompt。
-"""
-
 import os
 import cv2
 import numpy as np
 from PIL import Image
 import torch
 from torchvision import transforms
-
 # diffusers imports
-from diffusers import InstructPix2PixPipeline  # 若报错，改用 StableDiffusionImg2ImgPipeline
+from diffusers import StableDiffusionInstructPix2PixPipeline, EulerAncestralDiscreteScheduler
+# from diffusers import InstructPix2PixPipeline  # 若报错，改用 StableDiffusionImg2ImgPipeline
 # from diffusers import StableDiffusionImg2ImgPipeline as Img2ImgPipeline
+from github_example.tools import download_image, get_images_by_frame_and_camera
+import argparse
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --------- 用户配置 ----------
-input_gt_dir = "./gt_frames"                # 原始 GT 帧（用于生成 pseudo-style 或用于配准）
-pix2pix_outputs_dir = "./pix2pix_outputs"   # 如果你已用 InstructPix2Pix 得到的直接放这里（可选）
-output_dir = "./temporal_diffusers_out"
-os.makedirs(output_dir, exist_ok=True)
-
 # 模型与 prompt
-model_id = "timbrooks/instruct-pix2pix"  # 例子模型 id；本地或 huggingface 模型均可
-prompt = "Make the scene look snowy, with gently falling snow and soft lighting."
+model_id = "/data/workspace/yhh/aigc/huggingface/instruct_pix2pix"
+# model_id = "timbrooks/instruct-pix2pix"
+# prompt = "Make the scene look snowy, with gently falling snow and soft lighting."
+# prompt = "turn the scene into a evening scene, with soft lighting."
+# prompt = "turn the scene into a raining. Water accumulation on the road surface."
+# prompt = "Make the scene look snowy"  # 效果没达到雪天效果
+
+# prompt = "Transform the scene into a sandstorm climate"    # 效果非常差
+# 效果还不行. 搭配 guidance_scale = 0.1
+prompt = (
+    "turn the scene into a severe sandstorm, dense sand and dust particles swirling densely in the air, "
+    "vehicles and traffic signs partially covered with a layer of sand but their outlines remain recognizable, "
+    "brownish-yellow haze dominating the atmosphere, reduced visibility with a hazy effect, "
+    "road surface covered in a thin layer of sand, "
+    "all vehicles maintain their original positions and driving directions, "
+    "lane lines are faintly visible beneath the dust, traffic rules remain strictly followed"
+)
+prompt = "turn the scene into a evening scene, with soft lighting."
+
 strength = 0.6   # img2img strength（0-1），越低越保留 init latents（或 init image）
 alpha_latent_mix = 0.85  # 用于混合 warped_prev_latent 与 current_encoded_latent 的权重（靠近1更保留前帧）
 num_inference_steps = 20
+# guidance_scale = 1.8
+# guidance_scale = 0.5
+# guidance_scale = 2
 guidance_scale = 7.5
-
+# guidance_scale = 12
 # optical flow params
 fb_params = dict(pyr_scale=0.5, levels=3, winsize=15, iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
-
-# transform
-to_pil = transforms.ToPILImage()
+to_pil = transforms.ToPILImage() # transform
 to_tensor = transforms.ToTensor()
-
 # --------- 加载 pipeline ----------
-pipe = InstructPix2PixPipeline.from_pretrained(model_id, torch_dtype=torch.float16 if device=="cuda" else torch.float32)
+pipe = StableDiffusionInstructPix2PixPipeline.from_pretrained(model_id, torch_dtype=torch.float16 if device=="cuda" else torch.float32)
 pipe = pipe.to(device)
 pipe.scheduler = pipe.scheduler  # 可替换 scheduler 以加速/质量 tradeoff
-
 # 获取 VAE 组件（不同模型命名可能不同）
 vae = pipe.vae
 unet = pipe.unet
@@ -70,16 +67,14 @@ def numpy_to_pil(arr):
     arr = (np.clip(arr, 0.0, 1.0) * 255).round().astype(np.uint8)
     return Image.fromarray(arr)
 
-# encode image to latent (using pipeline's VAE)
 def encode_image_to_latent(img_pil, device=device):
-    # expects PIL image in [0,1] scaled -> convert to tensor batch
     image = to_tensor(img_pil).unsqueeze(0).to(device)
-    # scale to [-1,1]
     image = 2.0 * image - 1.0
+    image = image.half()  # Cast input to float16 to match model's dtype
     with torch.no_grad():
-        latents = vae.encode(image).latent_dist.sample()  # shape [1, C, H/8, W/8] depending on model
-        latents = latents * 0.18215  # typical scaling (may differ by VAE impl)
-    return latents  # torch tensor
+        latents = vae.encode(image).latent_dist.sample()
+        latents = latents * 0.18215
+    return latents
 
 # decode latent to image
 def decode_latent_to_image(latents, device=device):
@@ -127,72 +122,103 @@ def warp_latent_by_flow(latent: torch.Tensor, flow_np):
     warped = torch.nn.functional.grid_sample(latent, grid_t, mode='bilinear', padding_mode='border', align_corners=True)
     return warped
 
-# process frames
-frame_files = sorted([os.path.join(input_gt_dir, f) for f in os.listdir(input_gt_dir) if f.lower().endswith((".png",".jpg"))])
-n = len(frame_files)
-assert n>0, "No frames found"
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image_dir', type=str, help='Path to the points3D.txt file')
+    args = parser.parse_args()
+    # image_dir = "/data/workspace/yhh/aigc/aigc_study/data/waymo_data/002/images"
+    image_dir = args.image_dir
+    # frame_start, frame_end = 0, 10
+    frame_start, frame_end = 0, 198
+    cameras = [0,1,2,3,4]
+    # cameras = [0]
+    # cameras = [0,1,2]
+    frame_files = get_images_by_frame_and_camera(
+        root_dir=image_dir,
+        frame_range=(frame_start, frame_end),
+        camera_ids=cameras
+    )
+    for path in frame_files:
+        print(path)
+    print(f"找到 {len(frame_files)} 张符合条件的图像：")
+    # import pdb; pdb.set_trace()
 
-prev_stylized = None
-prev_latent = None
+    # --------- 用户配置 ----------
+    pix2pix_outputs_dir = "./output/IP2P_temporal_res/pix2pix_outputs"   # 如果你已用 InstructPix2Pix 得到的直接放这里（可选）
+    output_dir = "./output/IP2P_temporal_res/temporal_diffusers_out"
+    os.makedirs(pix2pix_outputs_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
-for i, gt_path in enumerate(frame_files):
-    print(f"Processing frame {i+1}/{n}: {gt_path}")
-    gt_img = load_img(gt_path)
-    gt_np = pil_to_numpy(gt_img)
+    prev_stylized = None
+    prev_latent = None
+    only_IP2P = True
+    for i, gt_path in enumerate(frame_files):
+        print(f"Processing frame {i+1}/{len(frame_files)}: {gt_path}")
+        gt_img = load_img(gt_path)
+        gt_np = pil_to_numpy(gt_img)
+        # Step A: if you already have a pix2pix output for this GT, load it; else run InstructPix2Pix once to get a pseudo-target (optional)
+        pix2pix_out_path = os.path.join(pix2pix_outputs_dir, os.path.basename(gt_path))
+        # if os.path.exists(pix2pix_out_path):
+        #     target_stylized_pil = load_img(pix2pix_out_path)
+        # else:
+        if True:
+        # while(1):
+            # import pdb; pdb.set_trace()
+            # # prompt = "turn the scene into a raining. Water accumulation on the road surface."
+            # prompt = "convert this scene to a rainy day scene"
+            # prompt = "Make it look like it's raining. The road is wet and reflective."
+            # prompt = "Turn this scene into a rainy day. The asphalt road is wet with puddles, and there are water droplets on the windshield."
+            # guidance_scale = 7.5
+            # run one-shot InstructPix2Pix to get initial stylized target (this also creates initial stylized frames)
+            # out = pipe(prompt=prompt, image=gt_img, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale)
+            # target_stylized_pil = out.images[0]
+            target_stylized_pil = pipe(prompt=prompt, image=gt_img, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale).images[0]
+            target_stylized_pil.save(os.path.join(pix2pix_outputs_dir, os.path.basename(gt_path)))
+            print('i = ', i)
+            if only_IP2P: continue
+        print('finish-i = ', i)
+        import pdb; pdb.set_trace()
 
-    # Step A: if you already have a pix2pix output for this GT, load it; else run InstructPix2Pix once to get a pseudo-target (optional)
-    pix2pix_out_path = os.path.join(pix2pix_outputs_dir, os.path.basename(gt_path))
-    if os.path.exists(pix2pix_out_path):
-        target_stylized_pil = load_img(pix2pix_out_path)
-    else:
-        # run one-shot InstructPix2Pix to get initial stylized target (this also creates initial stylized frames)
-        out = pipe(prompt=prompt, image=gt_img, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale)
-        target_stylized_pil = out.images[0]
+        # encode current GT to latent (this latent represents content of GT)
+        curr_content_latent = encode_image_to_latent(gt_img)
 
-    # encode current GT to latent (this latent represents content of GT)
-    curr_content_latent = encode_image_to_latent(gt_img)
+        if i == 0:
+            # first frame: just produce stylized result from GT
+            # we already have target_stylized_pil from pix2pix or from pipe above
+            stylized = target_stylized_pil
+            # store stylized latent
+            prev_stylized = stylized
+            prev_latent = encode_image_to_latent(stylized)
+            # save
+            stylized.save(os.path.join(output_dir, f"frame_{i:03d}.png"))
+            continue
 
-    if i == 0:
-        # first frame: just produce stylized result from GT
-        # we already have target_stylized_pil from pix2pix or from pipe above
-        stylized = target_stylized_pil
-        # store stylized latent
+        # For i>0: compute optical flow from previous GT to current GT (or prev_stylized->curr_gt)
+        # Option A: flow from prev_stylized to current GT gives better alignment of style -> use prev_stylized & current GT
+        prev_img_np = pil_to_numpy(prev_stylized)
+        curr_img_np = pil_to_numpy(gt_img)
+        prev_gray = (cv2.cvtColor((prev_img_np*255).astype(np.uint8), cv2.COLOR_BGR2GRAY)).astype(np.uint8)
+        curr_gray = (cv2.cvtColor((curr_img_np*255).astype(np.uint8), cv2.COLOR_BGR2GRAY)).astype(np.uint8)
+        flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, **fb_params)  # flow from prev->curr pixels
+        # warp prev_latent to current view
+        warped_prev_latent = warp_latent_by_flow(prev_latent, flow)  # torch tensor
+        # mix warped prev latent with current content latent to produce initialization
+        init_latent = alpha_latent_mix * warped_prev_latent + (1.0 - alpha_latent_mix) * curr_content_latent.to(warped_prev_latent.dtype)
+        # Now run image2image sampling with `init_latents` set to init_latent (diffusers allows passing latents to pipeline)
+        # NOTE: API: InstructPix2PixPipeline accepts "image" param; some pipelines accept "latents" via low-level denoising.
+        # We'll use pipe with "image" parameter but initialize by decoding init_latent to image as init_image (practical and compatible).
+        init_img_pil = decode_latent_to_image(init_latent)
+        # Run one more guided pass to follow prompt but keep init appearance
+        out = pipe(prompt=prompt, image=init_img_pil, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale, strength=strength)
+        stylized = out.images[0]
+        # save stylized
+        stylized.save(os.path.join(output_dir, f"frame_{i:03d}.png"))
+        # update prev variables
         prev_stylized = stylized
         prev_latent = encode_image_to_latent(stylized)
-        # save
-        stylized.save(os.path.join(output_dir, f"frame_{i:03d}.png"))
-        continue
 
-    # For i>0: compute optical flow from previous GT to current GT (or prev_stylized->curr_gt)
-    # Option A: flow from prev_stylized to current GT gives better alignment of style -> use prev_stylized & current GT
-    prev_img_np = pil_to_numpy(prev_stylized)
-    curr_img_np = pil_to_numpy(gt_img)
+    print("Done. Smoothed stylized frames saved to:", output_dir)
 
-    prev_gray = (cv2.cvtColor((prev_img_np*255).astype(np.uint8), cv2.COLOR_BGR2GRAY)).astype(np.uint8)
-    curr_gray = (cv2.cvtColor((curr_img_np*255).astype(np.uint8), cv2.COLOR_BGR2GRAY)).astype(np.uint8)
+if __name__ == "__main__":
+    main()
 
-    flow = cv2.calcOpticalFlowFarneback(prev_gray, curr_gray, None, **fb_params)  # flow from prev->curr pixels
-
-    # warp prev_latent to current view
-    warped_prev_latent = warp_latent_by_flow(prev_latent, flow)  # torch tensor
-
-    # mix warped prev latent with current content latent to produce initialization
-    init_latent = alpha_latent_mix * warped_prev_latent + (1.0 - alpha_latent_mix) * curr_content_latent.to(warped_prev_latent.dtype)
-
-    # Now run image2image sampling with `init_latents` set to init_latent (diffusers allows passing latents to pipeline)
-    # NOTE: API: InstructPix2PixPipeline accepts "image" param; some pipelines accept "latents" via low-level denoising.
-    # We'll use pipe with "image" parameter but initialize by decoding init_latent to image as init_image (practical and compatible).
-    init_img_pil = decode_latent_to_image(init_latent)
-
-    # Run one more guided pass to follow prompt but keep init appearance
-    out = pipe(prompt=prompt, image=init_img_pil, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale, strength=strength)
-    stylized = out.images[0]
-
-    # save stylized
-    stylized.save(os.path.join(output_dir, f"frame_{i:03d}.png"))
-
-    # update prev variables
-    prev_stylized = stylized
-    prev_latent = encode_image_to_latent(stylized)
-
-print("Done. Smoothed stylized frames saved to:", output_dir)
