@@ -21,26 +21,76 @@ model_id = "/data/workspace/yhh/aigc/huggingface/instruct_pix2pix"
 # prompt = "turn the scene into a raining. Water accumulation on the road surface."
 # prompt = "Make the scene look snowy"  # 效果没达到雪天效果
 
-# prompt = "Transform the scene into a sandstorm climate"    # 效果非常差
-# 效果还不行. 搭配 guidance_scale = 0.1
-prompt = (
-    "turn the scene into a severe sandstorm, dense sand and dust particles swirling densely in the air, "
-    "vehicles and traffic signs partially covered with a layer of sand but their outlines remain recognizable, "
-    "brownish-yellow haze dominating the atmosphere, reduced visibility with a hazy effect, "
-    "road surface covered in a thin layer of sand, "
-    "all vehicles maintain their original positions and driving directions, "
-    "lane lines are faintly visible beneath the dust, traffic rules remain strictly followed"
-)
 prompt = "turn the scene into a evening scene, with soft lighting."
+guidance_scale = 7.5
+
+# 傍晚场景 - 效果还行.
+if True:
+    prompt = "turn the scene into a evening scene, with soft lighting."
+    guidance_scale = 7.5
+
+
+# 沙尘暴场景 - 效果还行. 搭配 guidance_scale = 0.1； （camera4 图像变成全黑）
+if False:
+# if True:
+    # prompt = "Transform the scene into a sandstorm climate"    # 效果非常差
+    # 效果还行. 搭配 guidance_scale = 0.1
+    prompt = (
+        "turn the scene into a severe sandstorm, dense sand and dust particles swirling densely in the air, "
+        "vehicles and traffic signs partially covered with a layer of sand but their outlines remain recognizable, "
+        "brownish-yellow haze dominating the atmosphere, reduced visibility with a hazy effect, "
+        "road surface covered in a thin layer of sand, "
+        "all vehicles maintain their original positions and driving directions, "
+        "lane lines are faintly visible beneath the dust, traffic rules remain strictly followed"
+    )
+    guidance_scale = 0.1
+
+
+# sunset场景： 生成的场景感觉还可以更好
+if False:
+# if True:
+    prompt = (
+        "turn the scene into a sunset scene, orange and pink sky with a visible sun (low on the horizon), "
+        # "Can see the sunset ahead "
+        "warm golden light casting long shadows on the road, "
+        "road and lane lines are clearly visible, vehicles and traffic signs remain unchanged in shape, color and position, "
+        "vehicle headlights are off (natural sunset light is sufficient), street lights are not yet on"
+    )
+    negative_prompt = (
+        "blurred lane lines, moved vehicles, distorted traffic signs, "
+        "changed road shape, missing vehicles, altered lane positions, "
+        "night sky, stars, bright sunlight (not sunset), headlights or street lights on, no visible sun"
+    )
+
+# 雨天 - 一般般
+if True:
+# if False:
+    prompt = (
+        "turn the scene into a rainy day, heavy rain falling with visible raindrops, "
+        "road surface is wet and reflects car headlights and street lights, "
+        "dark gray sky with overcast clouds, "
+        "all vehicles, lane lines, road markings, and traffic signs remain unchanged in position and shape, "
+        "windshield wipers on vehicles are active, "
+        "visibility is slightly reduced but road elements are still clearly recognizable"
+    )
+    # 这条 prompt 的效果很好啊！！ 在 fisheye 上;  guidance_scale = 7.5
+    # 在 LC数据表现还行 上;  guidance_scale = 10
+    prompt = (
+        "turn the scene into a rainy day, heavy rain falling with visible raindrops, "
+    )
+    guidance_scale = 10
+    # guidance_scale = 7.5
+    # guidance_scale = 0.1
+    # guidance_scale = 1
+    # guidance_scale = 4
+    # guidance_scale = 6
+    # guidance_scale = 6.5
+    # guidance_scale = 7
+    # guidance_scale = 150
 
 strength = 0.6   # img2img strength（0-1），越低越保留 init latents（或 init image）
 alpha_latent_mix = 0.85  # 用于混合 warped_prev_latent 与 current_encoded_latent 的权重（靠近1更保留前帧）
 num_inference_steps = 20
-# guidance_scale = 1.8
-# guidance_scale = 0.5
-# guidance_scale = 2
-guidance_scale = 7.5
-# guidance_scale = 12
 # optical flow params
 fb_params = dict(pyr_scale=0.5, levels=3, winsize=15, iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
 to_pil = transforms.ToPILImage() # transform
@@ -122,26 +172,36 @@ def warp_latent_by_flow(latent: torch.Tensor, flow_np):
     warped = torch.nn.functional.grid_sample(latent, grid_t, mode='bilinear', padding_mode='border', align_corners=True)
     return warped
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--image_dir', type=str, help='Path to the points3D.txt file')
+    parser.add_argument('--image_dir', type=str, help='image_dir')
+    parser.add_argument('--single_frame', type=str, help='single_frame path')
     args = parser.parse_args()
     # image_dir = "/data/workspace/yhh/aigc/aigc_study/data/waymo_data/002/images"
-    image_dir = args.image_dir
-    # frame_start, frame_end = 0, 10
-    frame_start, frame_end = 0, 198
-    cameras = [0,1,2,3,4]
-    # cameras = [0]
-    # cameras = [0,1,2]
-    frame_files = get_images_by_frame_and_camera(
-        root_dir=image_dir,
-        frame_range=(frame_start, frame_end),
-        camera_ids=cameras
-    )
-    for path in frame_files:
-        print(path)
-    print(f"找到 {len(frame_files)} 张符合条件的图像：")
-    # import pdb; pdb.set_trace()
+    if args.image_dir is not None:
+        image_dir = args.image_dir
+        frame_start, frame_end = 0, 10
+        # frame_start, frame_end = 0, 198
+        # cameras = [0,1,2,3,4]
+        # cameras = [7,8,9,10]
+        # cameras = [0]
+        # cameras = [0,1,2]
+        # cameras = [0,3,4]
+        cameras = [1,2,5]
+        frame_files = get_images_by_frame_and_camera(
+            root_dir=image_dir,
+            frame_range=(frame_start, frame_end),
+            camera_ids=cameras
+        )
+        for path in frame_files:
+            print(path)
+        print(f"找到 {len(frame_files)} 张符合条件的图像：")
+    else:
+        single_frame = args.single_frame
+        frame_files = []
+        frame_files.append(single_frame)
+
 
     # --------- 用户配置 ----------
     pix2pix_outputs_dir = "./output/IP2P_temporal_res/pix2pix_outputs"   # 如果你已用 InstructPix2Pix 得到的直接放这里（可选）
@@ -164,14 +224,6 @@ def main():
         if True:
         # while(1):
             # import pdb; pdb.set_trace()
-            # # prompt = "turn the scene into a raining. Water accumulation on the road surface."
-            # prompt = "convert this scene to a rainy day scene"
-            # prompt = "Make it look like it's raining. The road is wet and reflective."
-            # prompt = "Turn this scene into a rainy day. The asphalt road is wet with puddles, and there are water droplets on the windshield."
-            # guidance_scale = 7.5
-            # run one-shot InstructPix2Pix to get initial stylized target (this also creates initial stylized frames)
-            # out = pipe(prompt=prompt, image=gt_img, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale)
-            # target_stylized_pil = out.images[0]
             target_stylized_pil = pipe(prompt=prompt, image=gt_img, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale).images[0]
             target_stylized_pil.save(os.path.join(pix2pix_outputs_dir, os.path.basename(gt_path)))
             print('i = ', i)
@@ -221,4 +273,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
 

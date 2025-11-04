@@ -43,7 +43,8 @@ def get_images_by_frame_and_camera(
     frame_range: Tuple[int, int],
     camera_ids: List[int]
 ) -> List[str]:
-    pattern = re.compile(r'^(\d+)_(\d+)\.jpg$')
+    # pattern = re.compile(r'^(\d+)_(\d+)\.jpg$')
+    pattern = re.compile(r'^(\d+)_(\d+)\.(png|jpg)$', flags=re.I)
     matched_files = []
     for filename in os.listdir(root_dir):
         match = pattern.match(filename)
